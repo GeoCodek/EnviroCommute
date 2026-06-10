@@ -249,10 +249,12 @@ PAGES = [
     {"kind": "gas",   "title": "Gas (kOhm)", "hkey": "gas_ox"},
     {"kind": "pms",   "title": "PM ug/m3",   "hkey": "pm2_5"},
     {"kind": "gps",   "title": "GPS",        "hkey": "gps_nsat"},
+    {"kind": "imu",   "title": "IMU",        "hkey": "imu_acc"},
+    {"kind": "action", "action": "calib", "title": "Calibrate IMU"},
     {"kind": "action", "action": "send", "title": "Send CSVs"},
 ]
 
-HIST_KEYS = ("temp", "hum", "pres", "lux", "gas_ox", "pm2_5", "gps_nsat")
+HIST_KEYS = ("temp", "hum", "pres", "lux", "gas_ox", "pm2_5", "gps_nsat", "imu_acc")
 
 
 def init_display():
@@ -423,20 +425,46 @@ def render_ui(ctx, st):
         draw.text((4, 27), "lat " + (_fmt(lat, "%.5f") if lat is not None else "--"), font=fontsmall, fill=(255, 255, 255))
         draw.text((4, 40), "lon " + (_fmt(lon, "%.5f") if lon is not None else "--"), font=fontsmall, fill=(255, 255, 255))
         render_graph(ctx, (4, 53, w - 4, h - 8), hist.get("gps_nsat", ()), 0, 12)
-    elif kind == "action":
-        ss = st["send_status"]; sd = st["send_detail"]
-        draw.text((4, 1), p["title"], font=fontsmall, fill=tcol)
-        if ss == "running":
-            draw.text((4, 16), "SENDING...", font=fontmed, fill=(255, 220, 0))
-        elif ss == "ok":
-            draw.text((4, 16), "SENT", font=fontmed, fill=(0, 230, 0))
-        elif ss == "fail":
-            draw.text((4, 16), "FAILED", font=fontmed, fill=(255, 70, 70))
+    elif kind == "imu":
+        imu = st.get("imu")
+        draw.text((4, 1), "IMU", font=fontsmall, fill=tcol)
+        if imu:
+            mag = (imu["ax"] ** 2 + imu["ay"] ** 2 + imu["az"] ** 2) ** 0.5
+            draw.text((4, 13), "a %+.2f %+.2f %+.2f" % (imu["ax"], imu["ay"], imu["az"]),
+                      font=fontsmall, fill=(255, 255, 255))
+            draw.text((4, 26), "g %+.0f %+.0f %+.0f" % (imu["gx"], imu["gy"], imu["gz"]),
+                      font=fontsmall, fill=(255, 255, 255))
+            draw.text((4, 39), "|a| %.2fg  %.0fC" % (mag, imu["temp"]),
+                      font=fontsmall, fill=(180, 180, 180))
         else:
-            draw.text((4, 16), "click to send", font=font, fill=(200, 200, 200))
-        if sd:
-            draw.text((4, 44), sd[:28], font=fontsmall, fill=(150, 150, 150))
-        draw.text((4, 58), "1 click = send latest CSVs", font=fontsmall, fill=(110, 110, 110))
+            draw.text((4, 16), "no IMU", font=font, fill=(255, 70, 70))
+        render_graph(ctx, (4, 53, w - 4, h - 8), hist.get("imu_acc", ()))
+    elif kind == "action":
+        draw.text((4, 1), p["title"], font=fontsmall, fill=tcol)
+        if p.get("action") == "calib":
+            cs = st["calib_status"]; cd = st["calib_detail"]
+            if cs == "ok":
+                draw.text((4, 16), "CALIBRATED", font=fontmed, fill=(0, 230, 0))
+            elif cs == "fail":
+                draw.text((4, 16), "MOVED", font=fontmed, fill=(255, 70, 70))
+            else:
+                draw.text((4, 16), "click to zero", font=font, fill=(200, 200, 200))
+            if cd:
+                draw.text((4, 44), cd[:28], font=fontsmall, fill=(150, 150, 150))
+            draw.text((4, 58), "1 click = zero gyro at rest", font=fontsmall, fill=(110, 110, 110))
+        else:
+            ss = st["send_status"]; sd = st["send_detail"]
+            if ss == "running":
+                draw.text((4, 16), "SENDING...", font=fontmed, fill=(255, 220, 0))
+            elif ss == "ok":
+                draw.text((4, 16), "SENT", font=fontmed, fill=(0, 230, 0))
+            elif ss == "fail":
+                draw.text((4, 16), "FAILED", font=fontmed, fill=(255, 70, 70))
+            else:
+                draw.text((4, 16), "click to send", font=font, fill=(200, 200, 200))
+            if sd:
+                draw.text((4, 44), sd[:28], font=fontsmall, fill=(150, 150, 150))
+            draw.text((4, 58), "1 click = send latest CSVs", font=fontsmall, fill=(110, 110, 110))
 
     # page-indicator dots along the bottom
     n = len(PAGES)
@@ -785,6 +813,102 @@ class SendJob:
         self.status = "ok" if rc == 0 else "fail"
 
 
+# ---------- MPU-6050 (GY-521) accel + gyro over I2C ----------
+class MPU6050:
+    """Minimal MPU-6050 reader on the shared I2C bus.
+    accel in g (+/-2g range), gyro in deg/s (+/-250 range), plus die temp (C).
+    Degrades gracefully (ok == False) if the chip isn't present.
+    """
+
+    def __init__(self, bus, addr=0x68):
+        self.bus = bus
+        self.addr = addr
+        self.ok = False
+        self.who = None
+        self._accel_scale = 16384.0   # LSB/g at +/-2g
+        self._gyro_scale = 131.0      # LSB/(deg/s) at +/-250 dps
+        self.gx_off = 0.0             # gyro zero-rate offsets (set by calibrate())
+        self.gy_off = 0.0
+        self.gz_off = 0.0
+        self.accel_corr = 1.0         # accel gain so |a| at rest -> 1 g
+        try:
+            self.who = bus.read_byte_data(addr, 0x75)   # WHO_AM_I
+            bus.write_byte_data(addr, 0x6B, 0x00)       # PWR_MGMT_1: wake (clear sleep)
+            time.sleep(0.05)
+            bus.write_byte_data(addr, 0x1A, 0x03)       # CONFIG: DLPF ~44 Hz (less noise)
+            bus.write_byte_data(addr, 0x1B, 0x00)       # GYRO_CONFIG: +/-250 dps
+            bus.write_byte_data(addr, 0x1C, 0x00)       # ACCEL_CONFIG: +/-2 g
+            self.ok = True
+        except Exception:
+            self.ok = False
+
+    def _raw(self):
+        if not self.ok:
+            return None
+        try:
+            d = self.bus.read_i2c_block_data(self.addr, 0x3B, 14)  # accel(6)+temp(2)+gyro(6)
+        except Exception:
+            return None
+
+        def _c(h, l):
+            v = (h << 8) | l
+            return v - 65536 if v >= 32768 else v
+
+        return {
+            "ax": _c(d[0], d[1]) / self._accel_scale,
+            "ay": _c(d[2], d[3]) / self._accel_scale,
+            "az": _c(d[4], d[5]) / self._accel_scale,
+            "temp": _c(d[6], d[7]) / 340.0 + 36.53,
+            "gx": _c(d[8], d[9]) / self._gyro_scale,
+            "gy": _c(d[10], d[11]) / self._gyro_scale,
+            "gz": _c(d[12], d[13]) / self._gyro_scale,
+        }
+
+    def read(self):
+        """Calibrated sample: gyro zero-rate removed, accel scaled so |a|~1g."""
+        r = self._raw()
+        if r is None:
+            return None
+        r["gx"] -= self.gx_off
+        r["gy"] -= self.gy_off
+        r["gz"] -= self.gz_off
+        r["ax"] *= self.accel_corr
+        r["ay"] *= self.accel_corr
+        r["az"] *= self.accel_corr
+        return r
+
+    def calibrate(self, dur=1.2):
+        """Zero the gyro and normalise |accel| to 1 g, assuming the unit is at
+        rest. Returns (ok, message); rejects if movement is detected."""
+        if not self.ok:
+            return (False, "no IMU")
+        gx, gy, gz, mags = [], [], [], []
+        t0 = time.time()
+        while time.time() - t0 < dur:
+            r = self._raw()
+            if r is not None:
+                gx.append(r["gx"]); gy.append(r["gy"]); gz.append(r["gz"])
+                mags.append((r["ax"] ** 2 + r["ay"] ** 2 + r["az"] ** 2) ** 0.5)
+            time.sleep(0.01)
+        n = len(gx)
+        if n < 10:
+            return (False, "read error")
+
+        def _std(a):
+            m = sum(a) / len(a)
+            return (sum((x - m) ** 2 for x in a) / len(a)) ** 0.5
+
+        # std-based stillness (robust to the PMS fan vibration / single spikes)
+        if max(_std(gx), _std(gy), _std(gz)) > 2.5 or _std(mags) > 0.04:
+            return (False, "moving-hold still")
+        self.gx_off = sum(gx) / n
+        self.gy_off = sum(gy) / n
+        self.gz_off = sum(gz) / n
+        mean_mag = sum(mags) / n
+        self.accel_corr = (1.0 / mean_mag) if mean_mag > 0.5 else 1.0
+        return (True, "gyro 0, |a|=1g")
+
+
 # ---------- Sensors ----------
 def init_sensors():
     env_noise = noise.Noise()
@@ -796,7 +920,13 @@ def init_sensors():
             pms = PMS5003()
         except Exception:
             pms = None
-    return env_noise, bme, pms
+    mpu = None
+    for _a in (0x68, 0x69):
+        m = MPU6050(bus, _a)
+        if m.ok:
+            mpu = m
+            break
+    return env_noise, bme, pms, mpu
 
 
 def _pms_value(pm, attr: str, size, atm_fallback: bool = False):
@@ -839,7 +969,7 @@ def read_pms_basic(pms):
         return None
 
 
-def read_enviro(env_noise, bme, pms):
+def read_enviro(env_noise, bme, pms, mpu=None):
     try:
         lux = ltr559.get_lux()
     except Exception:
@@ -916,6 +1046,8 @@ def read_enviro(env_noise, bme, pms):
         except Exception:
             pass
 
+    imu = mpu.read() if mpu is not None else None
+
     return {
         "lux": lux, "prox": prox,
         "temp": temp, "hum": hum, "pres": pres, "alt": alt,
@@ -927,6 +1059,10 @@ def read_enviro(env_noise, bme, pms):
         "pm0_3_count": pm0_3_count, "pm0_5_count": pm0_5_count,
         "pm1_0_count": pm1_0_count, "pm2_5_count": pm2_5_count,
         "pm5_0_count": pm5_0_count, "pm10_count": pm10_count,
+        "imu_ax": (imu or {}).get("ax"), "imu_ay": (imu or {}).get("ay"),
+        "imu_az": (imu or {}).get("az"), "imu_gx": (imu or {}).get("gx"),
+        "imu_gy": (imu or {}).get("gy"), "imu_gz": (imu or {}).get("gz"),
+        "imu_temp": (imu or {}).get("temp"),
     }
 
 
@@ -971,6 +1107,14 @@ CSV_HEADER = [
     "gps_eph_m",
     "gps_epv_m",
     "gps_time_utc",
+    # MPU-6050 IMU
+    "imu_accel_x_g",
+    "imu_accel_y_g",
+    "imu_accel_z_g",
+    "imu_gyro_x_dps",
+    "imu_gyro_y_dps",
+    "imu_gyro_z_dps",
+    "imu_temp_C",
 ]
 
 
@@ -1018,7 +1162,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = ensure_data_dir(script_dir)
 
-    env_noise, bme, pms = init_sensors()
+    env_noise, bme, pms, mpu = init_sensors()
     display_ctx = init_display()
 
     recorder = Recorder(data_dir)
@@ -1033,11 +1177,14 @@ def main():
     sv = read_display_sensors(bme) if display_ctx else {}
     pm_cache = {"pm1_0": None, "pm2_5": None, "pm10": None}
     last_pm_t = 0.0
+    imu_cache = None
     hist = {k: deque(maxlen=HIST_MAXLEN) for k in HIST_KEYS}
     last_disp_refresh = 0.0
 
     toast_msg = ""
     toast_until = 0.0
+    calib_status = "idle"   # idle | ok | fail (last IMU calibration result)
+    calib_detail = ""
 
     def toast(msg):
         nonlocal toast_msg, toast_until
@@ -1076,6 +1223,10 @@ def main():
         print(f"[{now_iso_seconds()}] PMS5003 init failed. PM fields will remain blank.")
     else:
         print(f"[{now_iso_seconds()}] PMS5003 active.")
+    if mpu is not None and mpu.ok:
+        print(f"[{now_iso_seconds()}] MPU-6050 IMU active (addr 0x{mpu.addr:02X}, WHO_AM_I=0x{mpu.who:02X}).")
+    else:
+        print(f"[{now_iso_seconds()}] MPU-6050 not found. IMU columns blank.")
     if rotary.ok:
         print(f"[{now_iso_seconds()}] KY-040 encoder ready (GPIO {ENC_CLK_GPIO}/{ENC_DT_GPIO}/{ENC_SW_GPIO}).")
     else:
@@ -1142,6 +1293,18 @@ def main():
                         sendjob.start()
                         toast("sending CSVs...")
                         print(f"[{now_iso_seconds()}] send CSVs requested")
+                    elif p["kind"] == "action" and p.get("action") == "calib":
+                        if display_ctx:
+                            _d = display_ctx
+                            _d["draw"].rectangle((0, 0, _d["w"], _d["h"]), (0, 0, 0))
+                            _d["draw"].text((6, 18), "HOLD STILL", font=_d["font"], fill=(255, 220, 0))
+                            _d["draw"].text((6, 44), "calibrating IMU...", font=_d["fontsmall"], fill=(180, 180, 180))
+                            _d["display"].display(_d["img"])
+                        ok, msg = mpu.calibrate() if mpu is not None else (False, "no IMU")
+                        calib_status = "ok" if ok else "fail"
+                        calib_detail = msg
+                        toast("IMU: " + msg)
+                        print(f"[{now_iso_seconds()}] IMU calibrate ok={ok} ({msg})")
                     else:
                         toast("2 clicks = record")
                 elif clicks == 2:
@@ -1182,24 +1345,29 @@ def main():
                 if _is_num(sv.get("ox")):   hist["gas_ox"].append(sv["ox"] / 1000.0)
                 if _is_num(pm_cache.get("pm2_5")): hist["pm2_5"].append(pm_cache["pm2_5"])
                 if _is_num(gps.get("nsat")): hist["gps_nsat"].append(gps["nsat"])
+                imu_cache = mpu.read() if mpu is not None else None
+                if imu_cache is not None:
+                    _amag = (imu_cache["ax"] ** 2 + imu_cache["ay"] ** 2 + imu_cache["az"] ** 2) ** 0.5
+                    hist["imu_acc"].append(_amag)
 
             # Display update (faster during overlays for smooth bars)
             disp_interval = 0.15 if (ctl.cover_active or shutdown_pending) else 0.5
             if display_ctx and (now - last_display_update) >= disp_interval:
                 st = {
                     "page": page, "sv": sv, "pm": pm_cache, "gps": gps, "gps_state": gps_state,
-                    "hist": hist, "is_recording": recorder.is_recording,
+                    "hist": hist, "is_recording": recorder.is_recording, "imu": imu_cache,
                     "cover_active": ctl.cover_active, "hold_progress": ctl.hold_progress, "phase": ctl.phase,
                     "shutdown_remaining": (shutdown_deadline - now) if shutdown_pending else None,
                     "toast": toast_msg if now < toast_until else None,
                     "send_status": sendjob.status, "send_detail": sendjob.detail,
+                    "calib_status": calib_status, "calib_detail": calib_detail,
                 }
                 render_ui(display_ctx, st)
                 last_display_update = now
 
             # Sampling (only while recording)
             if recorder.is_recording and now >= next_sample:
-                e = read_enviro(env_noise, bme, pms)
+                e = read_enviro(env_noise, bme, pms, mpu)
                 pm_cache = {"pm1_0": e["pm1_0"], "pm2_5": e["pm2_5"], "pm10": e["pm10"]}
                 last_pm_t = now
 
@@ -1244,6 +1412,13 @@ def main():
                     safe_float(gps["eph"]),
                     safe_float(gps["epv"]),
                     gps["gpstime"] if gps["gpstime"] is not None else "",
+                    safe_float(e["imu_ax"]),
+                    safe_float(e["imu_ay"]),
+                    safe_float(e["imu_az"]),
+                    safe_float(e["imu_gx"]),
+                    safe_float(e["imu_gy"]),
+                    safe_float(e["imu_gz"]),
+                    safe_float(e["imu_temp"]),
                 ]
 
                 recorder.write_row(row)

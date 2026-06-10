@@ -1,7 +1,7 @@
 # Enviro+ Commute Logger (Raspberry Pi)
 
 A mobile air-quality + GPS logger built on a Raspberry Pi with a Pimoroni **Enviro+**
-HAT, a **PMS5003** particulate sensor, a **u-blox NEO-M8N** GPS, and a **KY-040** rotary
+HAT, a **PMS5003** particulate sensor, a **u-blox NEO-M8N** GPS, an **MPU-6050** IMU, and a **KY-040** rotary
 encoder for on-device control. It records to timestamped CSVs, shows live colourful
 graphs on the Enviro+ LCD, and can push recordings to a PC over SSH.
 
@@ -15,6 +15,7 @@ Part of the [EnviroCommute](../README.md) project.
 - **Noise** — low / mid / high / total bands (I2S MEMS mic)
 - **Particulates** — PM1.0 / PM2.5 / PM10 + bin counts (PMS5003)
 - **GPS** — fix mode, lat/lon/alt, speed/track, satellites, UTC time (NEO-M8N)
+- **Motion** — 3-axis acceleration (g) + 3-axis rotation (°/s) + die temp (MPU-6050 IMU)
 
 All to `~/data/enviro_log_YYYY-MM-DD_<unix>.csv` (see [CSV columns](#csv-columns)).
 
@@ -23,7 +24,7 @@ All to `~/data/enviro_log_YYYY-MM-DD_<unix>.csv` (see [CSV columns](#csv-columns
 A 40-pin Raspberry Pi (developed on a Pi Zero 2 W running 32-bit Raspberry Pi OS /
 Raspbian) + Pimoroni Enviro+ HAT. The Enviro+ provides the BME280, LTR559, MICS6814,
 the I2S mic and a 0.96" ST7735 LCD, and brings out a PMS slot. The GPS and encoder are
-soldered to spare GPIOs.
+soldered to spare GPIOs; the MPU-6050 IMU just shares the existing I2C bus.
 
 ### Wiring
 
@@ -39,6 +40,8 @@ soldered to spare GPIOs.
 | KY-040 | **SW** | **GPIO13** | **33** | push button |
 | KY-040 | **+** | 3V3 | **17** | **power from 3V3, NOT 5V** — the onboard pull-ups would otherwise feed 5 V into the GPIOs |
 | KY-040 | **GND** | GND | **39** | |
+| **MPU-6050** | **SDA / SCL** | GPIO2 / GPIO3 | **3 / 5** | shares the Enviro+ I2C bus (addr **0x68**; AD0 left open). INT / XDA / XCL unused |
+| MPU-6050 | VCC / GND | 3V3 / GND | 1 or 17 / any GND | **power from 3V3, NOT 5V** (keeps the I2C pull-up levels safe) |
 
 > The Pi has only **one** usable hardware UART, and the Enviro+ claims it for the PMS
 > slot. That is why the GPS is read over a **bit-banged** software serial instead.
@@ -98,7 +101,7 @@ test plus a timed rotate/press window with a pass/fail summary (no Ctrl-C needed
 | Input | Action |
 |---|---|
 | **rotate** | move through the page carousel |
-| **1 click** | activate the current page if it is an action (e.g. *Send CSVs*) |
+| **1 click** | activate the current page if it is an action (e.g. *Send CSVs*, *Calibrate IMU*) |
 | **2 clicks** (< 1 s) | start / stop recording |
 | **4 clicks** | shutdown (3 s cancellable countdown — rotate or click to abort) |
 
@@ -111,8 +114,22 @@ recording over SSH.
 
 A carousel of pages, each with a **colourful scrolling graph**: temperature, humidity,
 pressure, light, gas, a **PMS** page (PM1 / 2.5 / 10 + a PM2.5 graph), a **GPS** page
-(mode / sats / lat-lon + a satellite-count graph), and a **Send CSVs** action page.
-Top-right status dot: **red = recording, yellow = idle**.
+(mode / sats / lat-lon + a satellite-count graph), an **IMU** page (accel / gyro / `|a|` +
+die temp, with an acceleration-magnitude graph), a **Calibrate IMU** action page, and a
+**Send CSVs** action page. Top-right status dot: **red = recording, yellow = idle**.
+
+### IMU calibration
+
+The **Calibrate IMU** page does a one-click *at-rest* calibration: hold the unit still and
+single-click. It averages ~1.2 s and then (a) subtracts the **gyro zero-rate bias** and
+(b) scales the accelerometer so `|a|` reads 1 g. A **standard-deviation stillness guard**
+rejects the calibration if it senses motion (any gyro axis std > 2.5 °/s, or `|a|` std >
+0.04 g) — std rather than peak-to-peak, so the PMS fan's vibration is tolerated but real
+motion isn't. The correction is applied to both the live display and the logged CSV.
+
+Only the single-position calibration (gyro-zero + `|a|` normalisation) is done; full
+6-position accelerometer calibration is skipped by choice. Gyro bias drifts a little with
+temperature, so recalibrate after warm-up or whenever you're stopped and still.
 
 ## CSV columns
 
@@ -125,15 +142,20 @@ pm1_0_ug_m3, pm2_5_ug_m3, pm10_ug_m3, pm1_0_atm_ug_m3, pm2_5_atm_ug_m3,
 pm10_atm_ug_m3, pm0_3_count, pm0_5_count, pm1_0_count, pm2_5_count,
 pm5_0_count, pm10_count,
 gps_mode, gps_lat, gps_lon, gps_alt_m, gps_speed_m_s, gps_track_deg,
-gps_climb_m_s, gps_eph_m, gps_epv_m, gps_time_utc
+gps_climb_m_s, gps_eph_m, gps_epv_m, gps_time_utc,
+imu_accel_x_g, imu_accel_y_g, imu_accel_z_g,
+imu_gyro_x_dps, imu_gyro_y_dps, imu_gyro_z_dps, imu_temp_C
 ```
+
+(The IMU columns are blank until an IMU is present; values are calibrated once you run
+*Calibrate IMU*.)
 
 ## Setup
 
 1. **OS + libs.** Raspberry Pi OS. Create a venv and install Pimoroni's stack:
    ```bash
    python3 -m venv ~/.virtualenvs/pimoroni
-   ~/.virtualenvs/pimoroni/bin/pip install enviroplus pms5003 st7735 pimoroni-bme280 ltr559 pigpio
+   ~/.virtualenvs/pimoroni/bin/pip install enviroplus pms5003 st7735 pimoroni-bme280 ltr559 pigpio smbus2
    ```
 2. **`/boot/firmware/config.txt`** — the relevant lines from this build:
    ```ini
@@ -178,9 +200,10 @@ your Pi's public key into it first).
 
 ## Files
 
-- `enviro_logger.py` — the logger: sensors, display/UI, recorder, GPS bit-bang, encoder.
+- `enviro_logger.py` — the logger: sensors (incl. MPU-6050 IMU), display/UI, recorder, GPS bit-bang, encoder.
 - `send_csvs.sh` — incremental CSV → PC sync.
 - `encoder_test.py` — standalone KY-040 wiring tester.
+- `mpu6050_probe.py` — standalone MPU-6050 I2C check (WHO_AM_I + one sample).
 - `systemd/` — service unit + the essential pigpiod `-t 0` drop-in.
 - `setup/pc_ssh_receiver_setup.ps1` — Windows OpenSSH receiver setup helper.
 
