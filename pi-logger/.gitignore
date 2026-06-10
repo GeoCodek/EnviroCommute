@@ -1,0 +1,11 @@
+# recorded data
+data/
+*.csv
+
+# runtime / local config (host-specific; keep out of git)
+.enviro_pc_dest
+*.log
+
+# python
+__pycache__/
+*.pyc
