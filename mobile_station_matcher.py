@@ -372,7 +372,8 @@ def read_csv_flexible(path: str | Path) -> pd.DataFrame:
 
 def extract_mobile_aq_columns(df: pd.DataFrame) -> list[str]:
     """
-    Select source-measurement columns (all non-GPS numeric sensor fields).
+    Select source-measurement (air-quality) columns: numeric sensor fields that are
+    not position (GPS), motion (IMU accel/gyro/die-temp), or bookkeeping fields.
     """
     exclude_norm = {normalize_col_name(c) for c in TIMESTAMP_CANDIDATES + LAT_CANDIDATES + LON_CANDIDATES}
     exclude_norm.update(
@@ -394,10 +395,14 @@ def extract_mobile_aq_columns(df: pd.DataFrame) -> list[str]:
         }
     )
 
+    # GPS = position, IMU = motion (accel / gyro / die-temp): neither is air quality,
+    # so they must not be merged into the station-comparison output as mobile_aq__*.
+    non_aq_prefixes = ("gps_", "imu_")
+
     candidate_cols = []
     for col in df.columns:
         n = normalize_col_name(col)
-        if n in exclude_norm or n.startswith("gps_"):
+        if n in exclude_norm or n.startswith(non_aq_prefixes):
             continue
         candidate_cols.append(col)
 
