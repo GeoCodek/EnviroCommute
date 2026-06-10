@@ -1,0 +1,17 @@
+[Unit]
+Description=Enviro+ commute logger (GPS bit-bang + PMS5003 + KY-040 encoder)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User, WorkingDirectory and the venv path to your install.
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/home/pi/.virtualenvs/pimoroni/bin/python /home/pi/enviro_logger.py
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
